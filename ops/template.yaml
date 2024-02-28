@@ -1,0 +1,221 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+
+Description: Stack for practice
+
+Parameters:
+  InfraStackName:
+    Type: String
+    Default: base-infra
+
+  ImageUrl:
+    Type: String
+    Default: public.ecr.aws/docker/library/nginx:latest
+    Description: The url of a docker image that contains the application process that will handle the traffic for this service
+
+  ECSAMI:
+    Description: The Amazon Machine Image ID used for the cluster
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ecs/optimized-ami/amazon-linux-2023/recommended/image_id
+
+Resources:
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Action: ['sts:AssumeRole']
+            Principal:
+              Service: [ec2.amazonaws.com]
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
+
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+
+  ECSService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - ALBListener
+    Properties:
+      Cluster: !Ref ECSCluster
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 50
+      # must be at least 2 instances in production
+      DesiredCount: 1
+      HealthCheckGracePeriodSeconds: 60
+      LaunchType: EC2
+      LoadBalancers:
+        - ContainerName: web
+          ContainerPort: 80
+          TargetGroupArn: !Ref ALBTargetGroup
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets: !Split [',', Fn::ImportValue: !Join ['::', [!Ref InfraStackName, PublicSubnets]]]
+          SecurityGroups:
+          - !GetAtt ECSSecurityGroup.GroupId
+      TaskDefinition: !Ref ECSTaskDefinition
+
+  ECSTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      NetworkMode: awsvpc
+      ExecutionRoleArn: !Ref ECSTaskExecutionRole
+      RequiresCompatibilities:
+        - EC2
+      ContainerDefinitions:
+        - Image: !Ref ImageUrl
+          Name: web
+          Memory: 512
+          PortMappings:
+            - ContainerPort: 80
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: web
+              mode: non-blocking
+              max-buffer-size: 25m
+              
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    UpdateReplacePolicy: Delete
+    DeletionPolicy: Delete
+
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Action: ['sts:AssumeRole']
+            Principal:
+              Service: [ecs-tasks.amazonaws.com]
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:*
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  CapacityProvider:
+    Type: AWS::ECS::CapacityProvider
+    Properties:
+      AutoScalingGroupProvider:
+        AutoScalingGroupArn: !Ref AutoScalingGroup
+
+  ClusterCapacityProviderAssociations:
+    Type: AWS::ECS::ClusterCapacityProviderAssociations
+    Properties:
+      CapacityProviders:
+        - !Ref CapacityProvider
+      Cluster: !Ref ECSCluster
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: !Ref CapacityProvider
+          Weight: 1
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn:
+      - ECSCluster
+      - EC2Role
+    Properties:
+      MaxSize: '1'
+      MinSize: '0'
+      DesiredCapacity: '1'
+      VPCZoneIdentifier: !Split [',', Fn::ImportValue: !Join ['::', [!Ref InfraStackName, PublicSubnets]]]
+      LaunchTemplate:
+        Version: !GetAtt ContainerInstance.LatestVersionNumber
+        LaunchTemplateId: !Ref ContainerInstance
+
+  ContainerInstance:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref ECSAMI
+        InstanceType: t2.micro
+        IamInstanceProfile:
+          Name: !Ref EC2InstanceProfile
+        SecurityGroupIds:
+          - !Ref ECSSecurityGroup
+        UserData: 
+          # This injected configuration file is how the EC2 instance
+          # knows which ECS cluster on your AWS account it should be joining
+          !Base64
+          'Fn::Sub': |
+            #!/bin/bash 
+            echo ECS_CLUSTER=${ECSCluster} >> /etc/ecs/ecs.config
+        # Disable IMDSv1, and require IMDSv2
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpTokens: required
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2Role
+
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      # Currently ECS task can't be registred using IPv6
+      # https://github.com/aws/containers-roadmap/issues/1340#issuecomment-1243037699
+      # IpAddressType: ipv6
+      TargetType: ip
+      HealthCheckPath: /
+      VpcId: 
+        Fn::ImportValue: !Join ['::', [!Ref InfraStackName, VPCid]]
+      Protocol: HTTP
+      Port: 80
+
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: application
+      IpAddressType: dualstack
+      SecurityGroups:
+        - !GetAtt ALBSecurityGroup.GroupId
+      Subnets: !Split [',', Fn::ImportValue: !Join ['::', [!Ref InfraStackName, PublicSubnets]]]
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: >- 
+        Load balancer security group
+      VpcId:
+        Fn::ImportValue: !Join ['::', [!Ref InfraStackName, VPCid]]
+      SecurityGroupIngress:
+      # Allow access to public facing ALB from any IP address
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: '-1'
+          CidrIpv6: ::/0
+
+  ECSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: >-
+        ECS security group
+      VpcId:
+        Fn::ImportValue: !Join ['::', [!Ref InfraStackName, VPCid]]
+
+  ECSSecurityInboundFromALB:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      IpProtocol: '-1'
+      GroupId: !GetAtt ECSSecurityGroup.GroupId
+      SourceSecurityGroupId: !GetAtt ALBSecurityGroup.GroupId

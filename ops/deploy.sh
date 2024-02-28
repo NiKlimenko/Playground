@@ -1,0 +1,1 @@
+sam deploy --profile dev --stack-name base-infra --template base.yaml

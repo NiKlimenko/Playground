@@ -1,0 +1,99 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+
+  IPv6CidrBlock:
+    Type: AWS::EC2::VPCCidrBlock
+    Properties:
+      VpcId: !Ref VPC
+      AmazonProvidedIpv6CidrBlock: true
+
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  RouteV6:
+    Type: AWS::EC2::Route
+    DependsOn: 
+      - VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationIpv6CidrBlock: ::/0
+      GatewayId: !Ref InternetGateway
+
+  RouteV4:
+    Type: AWS::EC2::Route
+    DependsOn: 
+      - VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetAZ0:
+    Type: AWS::EC2::Subnet
+    DependsOn: 
+      - IPv6CidrBlock
+    Properties:
+      VpcId: !Ref VPC
+      MapPublicIpOnLaunch: true
+      AssignIpv6AddressOnCreation: true
+      # ipv4 /20
+      CidrBlock: !Select [0, !Cidr [ !GetAtt VPC.CidrBlock, 6, 12 ]]
+      Ipv6CidrBlock: !Select [ 0, !Cidr [ !Select [ 0, !GetAtt VPC.Ipv6CidrBlocks], 256, 64 ]]
+      AvailabilityZone: !Select 
+        - 0
+        - !GetAZs us-east-1
+
+  Subnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref RouteTable
+      SubnetId: !Ref PublicSubnetAZ0
+
+  PublicSubnetAZ1:
+    Type: AWS::EC2::Subnet
+    DependsOn:
+      - IPv6CidrBlock
+    Properties:
+      VpcId: !Ref VPC
+      MapPublicIpOnLaunch: true
+      AssignIpv6AddressOnCreation: true
+      # ipv4 /20
+      CidrBlock: !Select [1, !Cidr [ !GetAtt VPC.CidrBlock, 6, 12 ]]
+      Ipv6CidrBlock: !Select [ 1, !Cidr [ !Select [ 0, !GetAtt VPC.Ipv6CidrBlocks], 256, 64 ]]
+      AvailabilityZone: !Select 
+        - 1
+        - !GetAZs us-east-1
+
+  Subnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref RouteTable
+      SubnetId: !Ref PublicSubnetAZ1
+
+Outputs:
+  VPCid:
+    Value: !Ref VPC
+    Export:
+      Name: !Join ['::', [!Ref AWS::StackName, VPCid]]
+
+  PublicSubnets:
+    Value: !Join [',', [!Ref PublicSubnetAZ0, !Ref PublicSubnetAZ1 ]]
+    Export:
+      Name: !Join ['::', [!Ref AWS::StackName, PublicSubnets]]
